@@ -16,7 +16,7 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 jobs = {}
 
-# ── Outils ──────────────────────────────────────────────────────────────────
+# ── Outils ───────────────────────────────────────────────────────────────────
 
 def find_ytdlp():
     found = shutil.which("yt-dlp")
@@ -29,18 +29,20 @@ YTDLP = find_ytdlp()
 def sanitize_filename(name: str) -> str:
     return re.sub(r'[^\w\s\-_\.]', '', name).strip()[:80]
 
-# ── Job de téléchargement ────────────────────────────────────────────────────
-
+# ── Regex progression yt-dlp : [download]  45.3% of 123MiB at 2.1MiB/s ETA 00:12
 PROGRESS_RE = re.compile(
     r"\[download\]\s+([\d\.]+)%"
     r"(?:.*?at\s+([\d\.]+\S+))?"
     r"(?:.*?ETA\s+(\S+))?"
 )
 
-def run_download(job_id: str, url: str):
+# ── Job de téléchargement ─────────────────────────────────────────────────────
+
+def run_download(job_id: str, url: str, fmt: str):
+    """fmt : 'mp4' ou 'mp3'"""
     job = jobs[job_id]
     try:
-        # Étape 1 : récupérer les métadonnées
+        # Étape 1 — métadonnées
         job["status"] = "fetching_info"
         info_result = subprocess.run(
             YTDLP + ["--dump-json", "--no-playlist", url],
@@ -49,23 +51,39 @@ def run_download(job_id: str, url: str):
         if info_result.returncode != 0:
             raise RuntimeError("Infos introuvables : " + info_result.stderr[-200:])
 
-        info = json.loads(info_result.stdout)
+        info  = json.loads(info_result.stdout)
         title = sanitize_filename(info.get("title", "video"))
         job["title"] = info.get("title", "vidéo")
-        out_file = DOWNLOAD_DIR / f"{job_id}_{title}.mp4"
 
-        # Étape 2 : téléchargement
+        # Étape 2 — téléchargement
         job.update({"status": "downloading", "progress": 0, "dl_speed": "", "dl_eta": ""})
 
-        proc = subprocess.Popen(
-            YTDLP + [
+        if fmt == "mp3":
+            out_file = DOWNLOAD_DIR / f"{job_id}_{title}.mp3"
+            dl_cmd = YTDLP + [
+                "--no-playlist",
+                "-f", "bestaudio/best",
+                "-x", "--audio-format", "mp3",
+                "--audio-quality", "0",          # meilleure qualité VBR
+                "--newline",
+                "-o", str(out_file),
+                url,
+            ]
+            job["filename"] = f"{title}.mp3"
+        else:
+            out_file = DOWNLOAD_DIR / f"{job_id}_{title}.mp4"
+            dl_cmd = YTDLP + [
                 "--no-playlist",
                 "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
                 "--merge-output-format", "mp4",
                 "--newline",
                 "-o", str(out_file),
                 url,
-            ],
+            ]
+            job["filename"] = f"{title}.mp4"
+
+        proc = subprocess.Popen(
+            dl_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -85,18 +103,20 @@ def run_download(job_id: str, url: str):
             raise RuntimeError("Erreur yt-dlp : " + job.get("last_line", ""))
 
         # yt-dlp peut légèrement renommer le fichier
+        ext = "mp3" if fmt == "mp3" else "mp4"
         if not out_file.exists():
-            candidates = list(DOWNLOAD_DIR.glob(f"{job_id}*.mp4"))
+            candidates = list(DOWNLOAD_DIR.glob(f"{job_id}*.{ext}"))
             if not candidates:
                 raise RuntimeError("Fichier introuvable après téléchargement.")
             out_file = candidates[0]
 
-        job.update({"status": "done", "file": str(out_file), "filename": f"{title}.mp4"})
+        job.update({"status": "done", "file": str(out_file)})
 
     except Exception as exc:
         job.update({"status": "error", "error": str(exc)})
 
-# ── Routes ───────────────────────────────────────────────────────────────────
+
+# ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
@@ -117,7 +137,7 @@ def api_info():
             return jsonify({"error": "yt-dlp : " + result.stderr[-300:]}), 400
 
         info = json.loads(result.stdout)
-        dur = info.get("duration", 0)
+        dur  = info.get("duration", 0)
         h, rem = divmod(int(dur), 3600)
         m, s   = divmod(rem, 60)
         return jsonify({
@@ -132,14 +152,20 @@ def api_info():
 
 @app.route("/api/download", methods=["POST"])
 def api_download():
-    url = (request.json or {}).get("url", "").strip()
+    body = request.json or {}
+    url  = body.get("url", "").strip()
+    fmt  = body.get("format", "mp4").strip().lower()
+    if fmt not in ("mp4", "mp3"):
+        fmt = "mp4"
     if not url:
         return jsonify({"error": "URL manquante"}), 400
 
     job_id = str(uuid.uuid4())[:8]
-    jobs[job_id] = {"status": "queued", "error": None, "file": None,
-                    "progress": 0, "dl_speed": "", "dl_eta": ""}
-    threading.Thread(target=run_download, args=(job_id, url), daemon=True).start()
+    jobs[job_id] = {
+        "status": "queued", "error": None, "file": None,
+        "progress": 0, "dl_speed": "", "dl_eta": "", "filename": ""
+    }
+    threading.Thread(target=run_download, args=(job_id, url, fmt), daemon=True).start()
     return jsonify({"job_id": job_id})
 
 
